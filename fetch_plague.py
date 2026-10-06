@@ -28,7 +28,6 @@ HEADERS = {
 
 # ---------------------------------------------------------------------------
 # Telegram Rich Message tag whitelist
-# https://core.telegram.org/bots/API#rich-html-style
 # ---------------------------------------------------------------------------
 TELEGRAM_ALLOWED_TAGS = {
     "a", "b", "strong", "i", "em", "u", "ins", "s", "strike", "del",
@@ -62,7 +61,7 @@ TELEGRAM_BLOCK_TAGS = {
 TELEGRAM_ATTR_WHITELIST = {
     "a":        ["href", "name"],
     "img":      ["src", "alt"],
-    "video":    ["src"],
+    "video":    ["src", "poster"],
     "audio":    ["src"],
     "tg-document": ["src"],
     "tg-map":   ["lat", "long", "zoom"],
@@ -80,15 +79,21 @@ TELEGRAM_ATTR_WHITELIST = {
     "tg-button-row": ["align"],
 }
 
+# Only truly useless elements here — NOT source/iframe/picture (handled inline)
 VOID_UNSUPPORTED = {
-    "iframe", "embed", "source", "track", "picture",
     "script", "style", "noscript", "template",
     "link", "meta", "base",
 }
 
 LAZY_SRC_ATTRS = ("data-src", "data-lazy-src", "data-original",
-                  "data-original-src", "data-url")
+                  "data-original-src", "data-url", "data-image")
 LAZY_SRCSET_ATTRS = ("data-srcset", "data-lazy-srcset")
+
+# Anything that looks like a placeholder instead of the real URL
+PLACEHOLDER_PATTERNS = (
+    "data:image", "placeholder", "blank.gif", "1x1.", "loading.gif",
+    "/lazy.", "lazy.png", "spacer.gif", "transparent.png",
+)
 
 # ---------------------------------------------------------------------------
 # Zoomit quote handling
@@ -104,30 +109,29 @@ QUOTE_PAIRS = (
 MIN_STANDALONE_QUOTE_LEN = 15
 
 # ---------------------------------------------------------------------------
-# Junk pruning (navigation, widgets, ads, social bars …)
+# Junk pruning
+# NOTE: deliberately does NOT include "meta", "caption", "media", "image",
+#       "video", "gallery" — those are legitimate media/caption classes.
 # ---------------------------------------------------------------------------
 JUNK_TAGS = {
-    "nav", "aside", "footer", "header", "form", "button",
+    "nav", "aside", "form", "button",
     "input", "select", "textarea", "label", "fieldset",
 }
 
 JUNK_CLASS_PATTERNS = (
     "comment", "related", "recommend", "promo", "advert", "banner",
-    "breadcrumb", "toc", "table-of-content", "tableofcontent",
-    "share", "social", "bookmark", "like", "rate", "rating",
-    "newsletter", "subscribe", "author", "byline", "bio",
-    "video-list", "videolist", "slider", "carousel",
+    "breadcrumb", "table-of-content", "tableofcontent", "toc-",
+    "share", "social", "bookmark", "like-button", "rating", "rate-",
+    "newsletter", "subscribe", "byline", "bio",
     "sidebar", "menu", "toolbar", "pagination", "pager",
-    "tag-list", "tags", "meta", "footer", "header",
+    "tag-list", "tags-list",
     "cookie", "consent", "popup", "modal", "overlay",
-    "gallery-thumb", "thumbnail-list",
 )
 
 JUNK_TEXT = (
     "کپی لینک",
     "تبلیغات",
     "بیشتر بخوانید",
-    "مطالعه '",
     "مقاله رو دوست داشتی؟",
     "نظرت چیه؟",
     "ارسال نظر",
@@ -305,8 +309,9 @@ def _extract_schema_article_body(soup) -> str:
 def _score_container(el: Tag) -> int:
     paragraphs = el.find_all("p")
     text_len = len(el.get_text(" ", strip=True))
-    score = len(paragraphs) * 200 + text_len
-    # Penalise containers that obviously hold junk widgets
+    # Boost containers that actually hold article media
+    media_count = len(el.find_all(["img", "figure", "video"]))
+    score = len(paragraphs) * 200 + text_len + media_count * 300
     text = el.get_text(" ", strip=True)
     for junk in ("تبلیغات", "بیشتر بخوانید", "کپی لینک", "ارسال نظر"):
         if junk in text:
@@ -372,7 +377,6 @@ def _extract_next_f(soup) -> str:
 
 
 def extract_article_body(link: str):
-    """Return (thumbnail_url, full_html_body)."""
     if not link:
         return "", ""
 
@@ -384,7 +388,6 @@ def extract_article_body(link: str):
 
     soup = BeautifulSoup(page_html, "html.parser")
 
-    # ---- thumbnail
     thumb = ""
     for prop in ("og:image", "twitter:image", "twitter:image:src"):
         m = (soup.find("meta", attrs={"property": prop})
@@ -410,7 +413,6 @@ def extract_article_body(link: str):
         candidates.append(("dom", dom_html))
         print(f"[debug] DOM container -> {len(dom_html)} chars")
 
-    # ---- newspaper3k over the SAME html (no second HTTP call)
     try:
         a = Article(link, config=build_newspaper_config())
         a.set_html(page_html)
@@ -423,9 +425,8 @@ def extract_article_body(link: str):
     except Exception as e:
         print(f"[warn] newspaper failed: {e}")
 
-    schema_text = _extract_schema_article_body(soup)
-
     if not candidates:
+        schema_text = _extract_schema_article_body(soup)
         if schema_text:
             html = "\n".join(
                 f"<p>{line}</p>"
@@ -454,16 +455,40 @@ def _media_id(url: str) -> str:
     return path.rsplit("/", 1)[-1].strip()
 
 
+def _is_placeholder(url: str) -> bool:
+    if not url:
+        return True
+    low = url.lower()
+    return any(p in low for p in PLACEHOLDER_PATTERNS)
+
+
 def _resolve_lazy_src(tag) -> str:
-    for attr in ("src",) + LAZY_SRC_ATTRS:
-        v = tag.get(attr)
-        if v:
-            return v.strip()
-    for attr in ("srcset",) + LAZY_SRCSET_ATTRS:
-        v = tag.get(attr)
-        if v:
-            return v.split(",")[0].strip().split(" ")[0]
-    return ""
+    """Return the real media URL, preferring data-* over placeholder src."""
+    real_attrs = [tag.get(a) for a in LAZY_SRC_ATTRS if tag.get(a)]
+    for url in real_attrs:
+        url = url.strip()
+        if url and not _is_placeholder(url):
+            return url
+
+    srcset_real = [tag.get(a) for a in ("srcset",) + LAZY_SRCSET_ATTRS if tag.get(a)]
+    for srcset in srcset_real:
+        first = srcset.split(",")[0].strip().split(" ")[0]
+        if first and not _is_placeholder(first):
+            return first
+
+    src = (tag.get("src") or "").strip()
+    if src and not _is_placeholder(src):
+        return src
+
+    # Last resort — return the first data-* value even if flagged placeholder
+    for url in real_attrs:
+        if url:
+            return url.strip()
+    for srcset in srcset_real:
+        first = srcset.split(",")[0].strip().split(" ")[0]
+        if first:
+            return first
+    return src
 
 
 def _is_quote_element(tag: Tag) -> bool:
@@ -523,17 +548,30 @@ def _has_junk_attr(tag) -> bool:
     return any(p.lower() in blob for p in JUNK_CLASS_PATTERNS)
 
 
+def _contains_media(tag) -> bool:
+    if not isinstance(tag, Tag):
+        return False
+    return tag.find(["img", "video", "audio", "figure", "picture"]) is not None
+
+
 def _prune_junk(soup: BeautifulSoup) -> None:
-    # 1) by tag
+    # 1) by tag — but never remove a node that holds media
     for tag in soup.find_all(JUNK_TAGS):
+        if _contains_media(tag):
+            tag.unwrap()
+            continue
         tag.decompose()
 
-    # 2) by class / id / role / data-* attribute
+    # 2) by class/id/role — again, keep media
     for tag in soup.find_all(_has_junk_attr):
+        if _contains_media(tag):
+            # keep the media, drop the junk wrapper shell
+            tag.unwrap()
+            continue
         tag.decompose()
 
-    # 3) by visible text — remove short blocks that match widget labels
-    for tag in soup.find_all(["p", "div", "span", "li", "a", "h2", "h3"]):
+    # 3) short text blocks matching Zoomit widget labels
+    for tag in soup.find_all(["p", "div", "span", "li", "h2", "h3"]):
         if tag.parent is None:
             continue
         text = tag.get_text(" ", strip=True)
@@ -542,35 +580,107 @@ def _prune_junk(soup: BeautifulSoup) -> None:
         if len(text) <= 60 and any(j in text for j in JUNK_TEXT):
             tag.decompose()
 
-    # 4) remove empty wrappers left behind
+    # 4) empty wrappers (but keep them if they hold media)
     for tag in soup.find_all(True):
         if tag.parent is None:
             continue
-        if tag.name in ("div", "span", "section", "article", "aside"):
-            if not tag.get_text(strip=True) and not tag.find(["img", "video", "audio"]):
+        if tag.name in ("div", "span", "section", "article"):
+            if not tag.get_text(strip=True) and not _contains_media(tag):
                 tag.decompose()
 
 
 # ---------------------------------------------------------------------------
 # Telegram-Rich-compatible description builder
 # ---------------------------------------------------------------------------
+def _convert_media(tag, soup) -> None:
+    """Normalise a single media element in place. Assumes tag is in soup."""
+    name = tag.name.lower()
+
+    # ---- <img> ----
+    if name == "img":
+        src = _resolve_lazy_src(tag)
+        if not src:
+            tag.decompose()
+            return
+        new = {"src": src}
+        alt = tag.get("alt")
+        if alt:
+            new["alt"] = alt.strip()
+        tag.attrs = new
+        return
+
+    # ---- <video> / <audio>: pull src from a child <source> if missing ----
+    if name in ("video", "audio"):
+        src = _resolve_lazy_src(tag)
+        if not src:
+            source_child = tag.find("source")
+            if source_child is not None:
+                src = _resolve_lazy_src(source_child)
+        if not src:
+            tag.decompose()
+            return
+        new = {"src": src}
+        poster = tag.get("poster")
+        if poster and name == "video":
+            new["poster"] = poster.strip()
+        tag.attrs = new
+        # drop any remaining <source> children
+        for s in tag.find_all("source"):
+            s.decompose()
+        return
+
+    # ---- <iframe>: Telegram can't render them — turn into a link ----
+    if name == "iframe":
+        src = (tag.get("src") or tag.get("data-src") or "").strip()
+        if not src:
+            tag.decompose()
+            return
+        a = soup.new_tag("a", href=src)
+        a.string = f"🔗 {src}"
+        tag.replace_with(a)
+        return
+
+    # ---- <picture>: promote the first usable <source>/<img> ----
+    if name == "picture":
+        img = tag.find("img")
+        if img is not None:
+            _convert_media(img, soup)
+            tag.replace_with(img)
+        else:
+            src = None
+            for s in tag.find_all("source"):
+                src = _resolve_lazy_src(s)
+                if src:
+                    break
+            if src:
+                new_img = soup.new_tag("img", src=src)
+                tag.replace_with(new_img)
+            else:
+                tag.decompose()
+        return
+
+    # ---- <source>/<track> outside their parent: just drop ----
+    if name in ("source", "track"):
+        tag.decompose()
+        return
+
+
 def _clean_html_for_telegram(html: str, thumbnail_url: str = "") -> str:
     if not html:
         return ""
 
     soup = BeautifulSoup(html, "html.parser")
 
-    # 1) hard removal of script/style/noscript/template
     for bad in soup(["script", "style", "noscript", "template"]):
         bad.decompose()
 
-    # 2) promote Zoomit quotes BEFORE pruning
+    # Promote quotes before pruning
     _promote_quotes(soup)
 
-    # 3) prune navigation, comments, ads, related widgets, etc.
+    # Prune widgets / nav, but media is protected inside the prune step
     _prune_junk(soup)
 
-    # 4) drop the header <h1> that duplicates the title
+    # Drop duplicate <h1> (title is stored separately)
     title_h1 = soup.find("h1")
     if title_h1 is not None:
         title_h1.decompose()
@@ -578,6 +688,14 @@ def _clean_html_for_telegram(html: str, thumbnail_url: str = "") -> str:
     thumb_norm = _normalize_media_url(thumbnail_url)
     thumb_id = _media_id(thumbnail_url)
 
+    # ---- First pass: normalise media (img/video/audio/iframe/picture) ----
+    for tag in list(soup.find_all(["img", "video", "audio", "iframe",
+                                   "picture", "source", "track"])):
+        if tag.parent is None:
+            continue
+        _convert_media(tag, soup)
+
+    # ---- Second pass: filter to Telegram tags ----
     for tag in soup.find_all(True):
         name = tag.name.lower()
         if tag.parent is None:
@@ -603,9 +721,9 @@ def _clean_html_for_telegram(html: str, thumbnail_url: str = "") -> str:
             tag.attrs = new
             continue
 
-        # ---- img ----
+        # ---- <img>: thumbnail exclusion happens here ----
         if name == "img":
-            src = _resolve_lazy_src(tag)
+            src = tag.get("src") or ""
             if not src:
                 tag.decompose()
                 continue
@@ -615,27 +733,29 @@ def _clean_html_for_telegram(html: str, thumbnail_url: str = "") -> str:
             if thumb_id and _media_id(src) == thumb_id:
                 tag.decompose()
                 continue
-            new = {"src": src}
-            if tag.get("alt"):
-                new["alt"] = tag["alt"]
-            tag.attrs = new
+            # attributes already normalized
             continue
 
         # ---- video / audio / tg-document ----
         if name in ("video", "audio", "tg-document"):
-            src = _resolve_lazy_src(tag)
-            if not src:
-                tag.decompose()
-                continue
-            tag.attrs = {"src": src}
+            allowed = TELEGRAM_ATTR_WHITELIST.get(name, [])
+            tag.attrs = {k: tag[k] for k in allowed
+                         if k in tag.attrs and tag[k] not in (None, "")}
             continue
 
-        # ---- everything else: whitelist attributes ----
+        # ---- whitelist attributes ----
         allowed = TELEGRAM_ATTR_WHITELIST.get(name, [])
         tag.attrs = {k: tag[k] for k in allowed
                      if k in tag.attrs and tag[k] not in (None, "")}
 
-    # 5) serialize with newlines between block elements
+    # ---- Remove now-empty <figure> (thumbnail was the only child) ----
+    for fig in soup.find_all("figure"):
+        if fig.parent is None:
+            continue
+        if not fig.get_text(strip=True) and not fig.find(["img", "video", "audio"]):
+            fig.decompose()
+
+    # Serialize with newlines between block elements
     parts = [str(c).strip() for c in soup.contents if str(c).strip()]
     html_str = "\n".join(parts)
 
@@ -670,6 +790,15 @@ def main():
 
     thumbnail, body_html = extract_article_body(target["link"])
     description = _clean_html_for_telegram(body_html, thumbnail)
+
+    # Debug: count media in the final description
+    final_soup = BeautifulSoup(description, "html.parser")
+    print(f"[debug] final media: "
+          f"img={len(final_soup.find_all('img'))}, "
+          f"video={len(final_soup.find_all('video'))}, "
+          f"audio={len(final_soup.find_all('audio'))}, "
+          f"figcaption={len(final_soup.find_all('figcaption'))}, "
+          f"blockquote={len(final_soup.find_all('blockquote'))}")
 
     result = {
         "title": target["title"],

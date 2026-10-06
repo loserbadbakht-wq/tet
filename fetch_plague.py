@@ -7,7 +7,7 @@ import zlib
 import requests
 import feedparser
 from newspaper import Article, Config
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString, Tag
 
 FEED_URL = "https://www.zoomit.ir/feed/"
 KEYWORD = "طاعون"
@@ -27,10 +27,10 @@ HEADERS = {
 
 # ---------------------------------------------------------------------------
 # Tags supported by Telegram Rich Messages (Rich HTML style)
-# Source: https://core.telegram.org/bots/API#rich-html-style
+# https://core.telegram.org/bots/API#rich-html-style
 # ---------------------------------------------------------------------------
 TELEGRAM_ALLOWED_TAGS = {
-    # inline text formatting
+    # inline text
     "a", "b", "strong", "i", "em", "u", "ins", "s", "strike", "del",
     "code", "mark", "sub", "sup", "tg-spoiler",
     # block text
@@ -45,17 +45,16 @@ TELEGRAM_ALLOWED_TAGS = {
     "tg-collage", "tg-slideshow", "tg-map",
     # tables
     "table", "tr", "th", "td", "caption",
-    # details / summaries
+    # details
     "details", "summary",
     # math
     "tg-math", "tg-math-block",
-    # buttons and interactive (preserved if present)
+    # buttons
     "tg-button", "tg-button-row",
-    # line break
+    # break
     "br",
 }
 
-# Tags that are block-level and should get a newline after their closing tag
 TELEGRAM_BLOCK_TAGS = {
     "h1", "h2", "h3", "h4", "h5", "h6",
     "p", "pre", "footer", "hr",
@@ -68,7 +67,6 @@ TELEGRAM_BLOCK_TAGS = {
     "tg-math-block",
 }
 
-# Attributes preserved per tag (only those meaningful for Telegram Rich HTML)
 TELEGRAM_ATTR_WHITELIST = {
     "a":        ["href", "name"],
     "img":      ["src", "alt"],
@@ -95,17 +93,93 @@ TELEGRAM_ATTR_WHITELIST = {
     "tg-emoji": ["emoji-id"],
 }
 
-# Void elements: if unsupported, remove completely (no inner content)
 VOID_UNSUPPORTED = {
     "iframe", "embed", "source", "track", "picture",
     "script", "style", "noscript", "template",
     "link", "meta", "base",
 }
 
-# Lazy-loading attribute names worth checking when src is missing
 LAZY_SRC_ATTRS = ("data-src", "data-lazy-src", "data-original",
                   "data-original-src", "data-url")
 LAZY_SRCSET_ATTRS = ("data-srcset", "data-lazy-srcset")
+
+# ---------------------------------------------------------------------------
+# Zoomit quote handling
+# ---------------------------------------------------------------------------
+# Class / id / role fragments that mark a container as a quote on Zoomit.
+QUOTE_HINTS = (
+    "quote", "blockquote", "pullquote", "pull-quote",
+    "نقل", "نقلقول", "نقل-قول", "گویه",
+)
+
+# Characters that can open / close a standalone quoted paragraph.
+QUOTE_PAIRS = (
+    ("«", "»"),
+    ("‹", "›"),
+    ("“", "”"),
+    ("„", "“"),
+    ('"', '"'),
+    ("'", "'"),
+)
+
+MIN_STANDALONE_QUOTE_LEN = 15   # avoid turning short «بله» into a blockquote
+
+
+def _is_quote_element(tag: Tag) -> bool:
+    """True if the element is (or carries a hint of being) a quote block."""
+    if not isinstance(tag, Tag):
+        return False
+    if tag.name == "blockquote":
+        return True
+
+    classes = " ".join(tag.get("class") or []).lower()
+    eid = (tag.get("id") or "").lower()
+    role = (tag.get("role") or "").lower()
+    data_q = " ".join(
+        f"{k}={v}" for k, v in tag.attrs.items()
+        if k.startswith("data-") and isinstance(v, str)
+    ).lower()
+
+    blob = f"{classes} {eid} {role} {data_q}"
+    return any(hint in blob for hint in QUOTE_HINTS)
+
+
+def _looks_like_standalone_quote(text: str) -> bool:
+    """True if the whole paragraph is one quoted sentence."""
+    t = (text or "").strip()
+    if len(t) < MIN_STANDALONE_QUOTE_LEN:
+        return False
+    for opener, closer in QUOTE_PAIRS:
+        if t.startswith(opener) and t.endswith(closer):
+            inner = t[len(opener):-len(closer)].strip()
+            # Make sure the opener/closer aren't reused inside
+            if opener not in inner and closer not in inner:
+                return True
+    return False
+
+
+def _promote_quotes(soup: BeautifulSoup) -> None:
+    """Normalise Zoomit's custom quote markup into real <blockquote> tags."""
+    # 1) Any element flagged as a quote becomes a <blockquote>, keeping
+    #    its inner formatting (strong / em / a / p / …).
+    for tag in soup.find_all(True):
+        if tag.name in ("html", "body"):
+            continue
+        if _is_quote_element(tag) and tag.name != "blockquote":
+            tag.name = "blockquote"
+            # keep only attributes that make sense on a blockquote
+            tag.attrs = {k: v for k, v in tag.attrs.items()
+                         if k in ("expandable",)}
+
+    # 2) A <p> that is entirely one «…» sentence becomes a blockquote.
+    #    (Zoomit sometimes renders pull-quotes as plain paragraphs.)
+    for p in soup.find_all("p"):
+        if p.find("blockquote"):
+            continue
+        text = p.get_text(" ", strip=True)
+        if _looks_like_standalone_quote(text):
+            bq = soup.new_tag("blockquote")
+            p.wrap(bq)
 
 
 # ---------------------------------------------------------------------------
@@ -132,35 +206,30 @@ def _maybe_decompress(raw: bytes, encoding: str) -> bytes:
     return raw
 
 
-def fetch_feed_bytes(url: str) -> bytes:
+def _request(url: str) -> bytes:
     headers = dict(HEADERS)
     headers["Accept-Encoding"] = "gzip, deflate"
-
     resp = requests.get(url, headers=headers, timeout=45, allow_redirects=True)
-    print(f"[debug] HTTP status: {resp.status_code}")
-    print(f"[debug] Final URL: {resp.url}")
-    print(f"[debug] Content-Type: {resp.headers.get('Content-Type')}")
-    print(f"[debug] Content-Encoding: {resp.headers.get('Content-Encoding')}")
-    print(f"[debug] Content-Length: {len(resp.content)}")
-
+    print(f"[debug] GET {url} -> {resp.status_code} "
+          f"({resp.headers.get('Content-Type')}, "
+          f"enc={resp.headers.get('Content-Encoding')}, "
+          f"{len(resp.content)}B)")
     raw = resp.content
-
-    content_encoding = resp.headers.get("Content-Encoding", "")
-    if content_encoding and content_encoding.lower() not in ("", "identity"):
-        if not raw.lstrip().startswith(b"<"):
-            raw = _maybe_decompress(raw, content_encoding)
-
+    enc = resp.headers.get("Content-Encoding", "")
+    if enc and enc.lower() not in ("", "identity") and not raw.lstrip().startswith(b"<"):
+        raw = _maybe_decompress(raw, enc)
     if not raw.lstrip().startswith(b"<"):
         try:
             import brotli
             raw = brotli.decompress(raw)
-            print("[debug] brotli decompress succeeded")
-        except Exception as e:
-            print(f"[debug] brotli fallback failed: {e}")
-
-    print(f"[debug] First 200 bytes after decode: {raw[:200]!r}")
+        except Exception:
+            pass
     resp.raise_for_status()
     return raw
+
+
+def fetch_feed_bytes(url: str) -> bytes:
+    return _request(url)
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +295,7 @@ def parse_with_regex(raw: bytes):
 
 
 # ---------------------------------------------------------------------------
-# Article extraction helpers
+# Article extraction
 # ---------------------------------------------------------------------------
 def build_newspaper_config() -> Config:
     cfg = Config()
@@ -254,11 +323,9 @@ def _media_id(url: str) -> str:
 def _pick_thumbnail(article: Article) -> str:
     if getattr(article, "top_image", None):
         return article.top_image.strip()
-
     meta = getattr(article, "meta_img", None)
     if meta:
         return meta.strip()
-
     for ns in ("og", "twitter"):
         data = article.meta_data.get(ns, {}) or {}
         for key in ("image", "image:src", "image:url"):
@@ -290,15 +357,17 @@ def _resolve_lazy_src(tag) -> str:
 # Telegram-Rich-compatible description builder
 # ---------------------------------------------------------------------------
 def _clean_html_for_telegram(html: str, thumbnail_url: str = "") -> str:
-    """Keep only Telegram Rich Message supported tags, remove everything else."""
     if not html:
         return ""
 
     soup = BeautifulSoup(html, "html.parser")
 
-    # Hard removal of script/style/noscript/template
+    # Hard removal of things we never want
     for bad in soup(["script", "style", "noscript", "template"]):
         bad.decompose()
+
+    # ----- Zoomit custom quotes -> <blockquote> -----
+    _promote_quotes(soup)
 
     thumb_norm = _normalize_media_url(thumbnail_url)
     thumb_id = _media_id(thumbnail_url)
@@ -309,34 +378,28 @@ def _clean_html_for_telegram(html: str, thumbnail_url: str = "") -> str:
         if tag.parent is None:
             continue
 
-        # Remove unsupported void elements entirely
         if name in VOID_UNSUPPORTED:
             tag.decompose()
             continue
 
-        # Unwrap tags that are not allowed (keep inner content)
         if name not in TELEGRAM_ALLOWED_TAGS:
             tag.unwrap()
             continue
 
-        # ----- img: keep only src + alt, drop the thumbnail -----
+        # ----- img -----
         if name == "img":
             src = _resolve_lazy_src(tag)
-
             if not src:
                 tag.decompose()
                 continue
-
             src_norm = _normalize_media_url(src)
             src_id = _media_id(src)
-
             if thumb_norm and src_norm == thumb_norm:
                 tag.decompose()
                 continue
             if thumb_id and src_id and src_id == thumb_id:
                 tag.decompose()
                 continue
-
             new_attrs = {"src": src}
             alt = tag.get("alt")
             if alt:
@@ -344,7 +407,7 @@ def _clean_html_for_telegram(html: str, thumbnail_url: str = "") -> str:
             tag.attrs = new_attrs
             continue
 
-        # ----- video / audio / tg-document: keep only src -----
+        # ----- video / audio / tg-document -----
         if name in ("video", "audio", "tg-document"):
             src = _resolve_lazy_src(tag)
             if not src:
@@ -353,7 +416,7 @@ def _clean_html_for_telegram(html: str, thumbnail_url: str = "") -> str:
             tag.attrs = {"src": src}
             continue
 
-        # ----- Whitelist attributes for all other allowed tags -----
+        # ----- whitelist attributes -----
         allowed = TELEGRAM_ATTR_WHITELIST.get(name, [])
         new_attrs = {}
         for k in allowed:
@@ -372,7 +435,6 @@ def _clean_html_for_telegram(html: str, thumbnail_url: str = "") -> str:
 
     html_str = "\n".join(parts)
 
-    # Add a newline after every closing block tag
     block_re = "|".join(sorted(TELEGRAM_BLOCK_TAGS))
     html_str = re.sub(
         rf"</({block_re})>",
@@ -380,7 +442,6 @@ def _clean_html_for_telegram(html: str, thumbnail_url: str = "") -> str:
         html_str,
     )
 
-    # Collapse excessive blank lines
     html_str = re.sub(r"[ \t]+\n", "\n", html_str)
     html_str = re.sub(r"\n{3,}", "\n\n", html_str)
     return html_str.strip()
@@ -402,6 +463,25 @@ def extract_article(link: str):
             html = article.article_html or ""
         except Exception:
             html = ""
+
+        # Fallback: fetch the page ourselves — Zoomit renders the body
+        # client-side, so newspaper3k sometimes gets nothing.
+        if not html or len(html) < 200:
+            try:
+                page = _request(link).decode("utf-8", errors="replace")
+                page_soup = BeautifulSoup(page, "html.parser")
+                # Try common Zoomit body containers first
+                body = (
+                    page_soup.find("article")
+                    or page_soup.find(attrs={"data-testid": re.compile("article|body", re.I)})
+                    or page_soup.find("main")
+                )
+                if body:
+                    html = str(body)
+                    print(f"[debug] used page-body fallback "
+                          f"({len(html)} chars)")
+            except Exception as e:
+                print(f"[warn] page fallback failed: {e}")
 
         if not html:
             text = (article.text or "").strip()

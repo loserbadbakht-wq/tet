@@ -1,6 +1,9 @@
 name: Fetch Plague News
 
 on:
+  push:
+    branches:
+      - beta
   workflow_dispatch:         # allow manual trigger
 
 jobs:

@@ -1,6 +1,9 @@
+import gzip
 import json
 import re
 import sys
+import zlib
+
 import requests
 import feedparser
 from newspaper import Article
@@ -22,21 +25,71 @@ HEADERS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Fetching
+# ---------------------------------------------------------------------------
+def _maybe_decompress(raw: bytes, encoding: str) -> bytes:
+    encoding = (encoding or "").lower().strip()
+    try:
+        if encoding == "gzip":
+            return gzip.decompress(raw)
+        if encoding == "deflate":
+            try:
+                return zlib.decompress(raw)
+            except zlib.error:
+                return zlib.decompress(raw, -zlib.MAX_WBITS)
+        if encoding == "br":
+            import brotli
+            return brotli.decompress(raw)
+        if encoding == "zstd":
+            import zstandard as zstd
+            return zstd.ZstdDecompressor().decompress(raw)
+    except Exception as e:
+        print(f"[warn] manual decompress ({encoding}) failed: {e}")
+    return raw
+
+
 def fetch_feed_bytes(url: str) -> bytes:
-    resp = requests.get(url, headers=HEADERS, timeout=45, allow_redirects=True)
+    # Ask only for encodings we can definitely decode in CI.
+    headers = dict(HEADERS)
+    headers["Accept-Encoding"] = "gzip, deflate"
+
+    resp = requests.get(url, headers=headers, timeout=45, allow_redirects=True)
     print(f"[debug] HTTP status: {resp.status_code}")
     print(f"[debug] Final URL: {resp.url}")
     print(f"[debug] Content-Type: {resp.headers.get('Content-Type')}")
+    print(f"[debug] Content-Encoding: {resp.headers.get('Content-Encoding')}")
     print(f"[debug] Content-Length: {len(resp.content)}")
-    print(f"[debug] First 300 bytes: {resp.content[:300]!r}")
+
+    raw = resp.content
+
+    # If requests didn't transparently decode, do it ourselves.
+    content_encoding = resp.headers.get("Content-Encoding", "")
+    if content_encoding and content_encoding.lower() not in ("", "identity"):
+        if not raw.lstrip().startswith(b"<"):
+            raw = _maybe_decompress(raw, content_encoding)
+
+    # Final fallback: try Brotli if the payload still doesn't look like XML.
+    if not raw.lstrip().startswith(b"<"):
+        try:
+            import brotli
+            raw = brotli.decompress(raw)
+            print("[debug] brotli decompress succeeded")
+        except Exception as e:
+            print(f"[debug] brotli fallback failed: {e}")
+
+    print(f"[debug] First 200 bytes after decode: {raw[:200]!r}")
     resp.raise_for_status()
-    return resp.content
+    return raw
 
 
+# ---------------------------------------------------------------------------
+# Cleaning / parsing
+# ---------------------------------------------------------------------------
 def clean_bytes(raw: bytes) -> bytes:
     if raw.startswith(b"\xef\xbb\xbf"):
         raw = raw[3:]
-    # remove control chars illegal in XML
+    # Remove control chars illegal in XML 1.0
     raw = re.sub(rb"[\x00-\x08\x0b\x0c\x0e-\x1f]", b"", raw)
     return raw
 
@@ -46,6 +99,7 @@ def parse_with_feedparser(raw: bytes):
     print(f"[debug] feedparser bozo={feed.bozo} entries={len(feed.entries)}")
     if feed.bozo:
         print(f"[debug] feedparser bozo_exception: {feed.bozo_exception}")
+
     items = []
     for e in feed.entries:
         items.append({
@@ -64,7 +118,9 @@ def parse_with_regex(raw: bytes):
         print("[debug] no <item> tags found in text")
         return []
 
-    blocks = re.findall(r"<item\b[^>]*>(.*?)</item>", text, flags=re.DOTALL | re.IGNORECASE)
+    blocks = re.findall(
+        r"<item\b[^>]*>(.*?)</item>", text, flags=re.DOTALL | re.IGNORECASE
+    )
     print(f"[debug] regex found {len(blocks)} <item> blocks")
 
     def pick(chunk: str, tag: str) -> str:
@@ -91,6 +147,9 @@ def parse_with_regex(raw: bytes):
     return items
 
 
+# ---------------------------------------------------------------------------
+# Article description
+# ---------------------------------------------------------------------------
 def extract_description(link: str) -> str:
     if not link:
         return ""
@@ -107,12 +166,15 @@ def extract_description(link: str) -> str:
         return ""
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 def main():
     raw = fetch_feed_bytes(FEED_URL)
 
     # Guard: if we got HTML instead of XML (Cloudflare / error page), bail early.
     stripped = raw.lstrip()
-    if stripped[:1] != b"<" or b"<rss" not in raw and b"<feed" not in raw:
+    if stripped[:1] != b"<":
         print("[error] Response does not look like an RSS feed.")
         print("[error] Head:", raw[:500])
         sys.exit(1)
@@ -149,8 +211,11 @@ def main():
         json.dump(result, f, ensure_ascii=False, indent=2)
 
     print(f"[ok] Wrote {OUTPUT_FILE}")
-    print(json.dumps({k: (v[:80] if isinstance(v, str) else v) for k, v in result.items()},
-                     ensure_ascii=False, indent=2))
+    print(json.dumps(
+        {k: (v[:80] if isinstance(v, str) else v) for k, v in result.items()},
+        ensure_ascii=False,
+        indent=2,
+    ))
 
 
 if __name__ == "__main__":

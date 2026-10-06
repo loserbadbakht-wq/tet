@@ -24,7 +24,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install feedparser newspaper3k lxml_html_clean
+          pip install --upgrade pip
+          pip install requests feedparser newspaper3k lxml_html_clean brotli
 
       - name: Fetch, extract, and save
         run: python fetch_plague.py
